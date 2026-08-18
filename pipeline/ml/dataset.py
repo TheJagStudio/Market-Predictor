@@ -8,17 +8,36 @@ from django.conf import settings
 
 from pipeline.ingest.engine import training_vector
 from pipeline.models import FeatureBar
+from pipeline.universe import TIMEFRAMES, normalize_assets
 
 
-def load_dataset(min_rows: int = 200, interval: int | None = None) -> tuple[np.ndarray, np.ndarray, list[str], list[int]]:
-    qs = FeatureBar.objects.filter(label_up_15m__isnull=False).order_by("ts")
+def resolve_label_field(label: str | None, label_field: str | None = None) -> str:
+    if label_field in {"label_up_next", "label_up_15m"}:
+        return label_field
+    if str(label or "").lower() in {"next", "label_up_next", "next_bar"}:
+        return "label_up_next"
+    return "label_up_15m"
+
+
+def load_dataset(
+    min_rows: int = 200,
+    interval: int | None = None,
+    assets: list[str] | None = None,
+    label: str | None = None,
+    label_field: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[str], list[int]]:
+    field = resolve_label_field(label, label_field)
+    qs = FeatureBar.objects.filter(**{f"{field}__isnull": False}).order_by("ts", "asset")
     if interval:
-        qs = qs.filter(interval_seconds=interval)
+        qs = qs.filter(interval_seconds=int(interval))
+    if assets:
+        qs = qs.filter(asset__in=normalize_assets(assets))
     rows = list(qs)
     if len(rows) < min_rows:
+        tf = next((k for k, v in TIMEFRAMES.items() if v == interval), str(interval or "any"))
         raise ValueError(
-            f"Need at least {min_rows} labeled bars; have {len(rows)}. "
-            "Run collection 24/7 or backfill Binance klines first."
+            f"Need at least {min_rows} bars labeled with {field} at {tf}; have {len(rows)}. "
+            "Backfill several coins on 1m (next-bar labels) to train a starter model quickly."
         )
     vectors = [training_vector(row.features or {}) for row in rows]
     keys: set[str] = set()
@@ -34,8 +53,7 @@ def load_dataset(min_rows: int = 200, interval: int | None = None) -> tuple[np.n
         for j, col in enumerate(columns):
             value = vec.get(col)
             X[i, j] = value if value is not None and not math.isnan(value) else np.nan
-    y = np.array([1 if row.label_up_15m else 0 for row in rows], dtype=int)
-    # median impute per column
+    y = np.array([1 if getattr(row, field) else 0 for row in rows], dtype=int)
     for j in range(X.shape[1]):
         col = X[:, j]
         med = np.nanmedian(col)

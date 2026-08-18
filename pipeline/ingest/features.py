@@ -13,20 +13,32 @@ class RealTimeTradeImbalance:
         if window_seconds <= 0:
             raise ValueError("window_seconds must be positive")
         self.window_seconds = float(window_seconds)
-        self.trades: deque[tuple[float, float]] = deque()
+        self.trades: deque[tuple[float, float, float]] = deque()
         self.current_imbalance = 0.0
+        self.current_volume = 0.0
 
     def process_tick(self, size: float, is_buyer_maker: bool, now: float) -> float:
         if size < 0:
             raise ValueError("size must be non-negative")
         trade_flow = -size if is_buyer_maker else size
-        self.trades.append((now, trade_flow))
+        abs_size = float(size)
+        self.trades.append((now, trade_flow, abs_size))
         self.current_imbalance += trade_flow
+        self.current_volume += abs_size
         cutoff = now - self.window_seconds
         while self.trades and self.trades[0][0] < cutoff:
-            _old_time, old_flow = self.trades.popleft()
+            _old_time, old_flow, old_abs = self.trades.popleft()
             self.current_imbalance -= old_flow
+            self.current_volume -= old_abs
+        if self.current_volume < 0:
+            self.current_volume = 0.0
         return self.current_imbalance
+
+    @property
+    def ratio(self) -> float | None:
+        if self.current_volume <= 0:
+            return None
+        return self.current_imbalance / self.current_volume
 
 
 class RealTimeVPIN:

@@ -39,6 +39,7 @@ class ProcessHeartbeat(models.Model):
 class LiveTick(models.Model):
     ts_ms = models.BigIntegerField(db_index=True)
     venue = models.CharField(max_length=32, db_index=True)
+    asset = models.CharField(max_length=16, default="BTC", db_index=True)
     kind = models.CharField(max_length=24, default="trade")
     price = models.FloatField(null=True, blank=True)
     size = models.FloatField(null=True, blank=True)
@@ -46,23 +47,27 @@ class LiveTick(models.Model):
     extra = models.JSONField(default=dict, blank=True)
 
     class Meta:
-        indexes = [models.Index(fields=["venue", "ts_ms"])]
+        indexes = [models.Index(fields=["venue", "ts_ms"]), models.Index(fields=["asset", "ts_ms"])]
 
 
 class FeatureBar(models.Model):
     ts = models.BigIntegerField()
+    asset = models.CharField(max_length=16, default="BTC", db_index=True)
     interval_seconds = models.PositiveSmallIntegerField(default=5)
     mid_price = models.FloatField(null=True, blank=True)
     features = models.JSONField(default=dict)
     label_up_15m = models.BooleanField(null=True, blank=True)
+    label_up_next = models.BooleanField(null=True, blank=True)
     label_poly_up = models.BooleanField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        unique_together = [("ts", "interval_seconds")]
+        unique_together = [("asset", "ts", "interval_seconds")]
         indexes = [
+            models.Index(fields=["asset", "interval_seconds", "ts"]),
             models.Index(fields=["interval_seconds", "ts"]),
             models.Index(fields=["label_up_15m"]),
+            models.Index(fields=["label_up_next"]),
         ]
 
 

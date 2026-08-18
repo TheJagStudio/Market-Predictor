@@ -19,6 +19,7 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
+import { AssetFields, TimeframeFields } from "@/components/universe-fields"
 
 export function SetupPage() {
   const { boot, refresh } = useBoot()
@@ -27,11 +28,18 @@ export function SetupPage() {
   const [enabled, setEnabled] = useState<string[]>(
     boot?.settings.enabled_sources ?? catalog.map((s) => s.id)
   )
+  const universe = boot?.universe
+  const [coins, setCoins] = useState<string[]>(
+    boot?.settings.enabled_assets ?? universe?.enabled_assets ?? universe?.default_assets ?? ["BTC", "ETH", "XRP"]
+  )
+  const [timeframes, setTimeframes] = useState<string[]>(
+    boot?.settings.bar_timeframes ?? universe?.enabled_timeframes ?? universe?.default_timeframes ?? ["1m", "5m", "15m"]
+  )
   const [dryRun, setDryRun] = useState(boot?.settings.dry_run !== false)
   const [minEdge, setMinEdge] = useState(String(boot?.settings.min_edge ?? 0.04))
   const [minConf, setMinConf] = useState(String(boot?.settings.min_confidence ?? 0.55))
   const [orderSize, setOrderSize] = useState(String(boot?.settings.order_size ?? 10))
-  const [barSec, setBarSec] = useState(String(boot?.settings.bar_interval_seconds ?? 5))
+  const [barSec, setBarSec] = useState(String(boot?.settings.bar_interval_seconds ?? 0))
   const [pk, setPk] = useState("")
   const [funder, setFunder] = useState(String(boot?.settings.polymarket_funder ?? ""))
   const [sigType, setSigType] = useState(String(boot?.settings.polymarket_signature_type ?? 0))
@@ -44,6 +52,8 @@ export function SetupPage() {
     try {
       const payload: Record<string, unknown> = {
         enabled_sources: enabled,
+        enabled_assets: coins,
+        bar_timeframes: timeframes,
         dry_run: dryRun,
         min_edge: Number(minEdge),
         min_confidence: Number(minConf),
@@ -69,9 +79,9 @@ export function SetupPage() {
       <div className="flex items-center gap-2">
         <CandlestickChartIcon />
         <div className="flex flex-col">
-          <h1 className="text-lg font-medium">Setup BTC 15-minute pipeline</h1>
+          <h1 className="text-lg font-medium">Setup multi-coin 15-minute pipeline</h1>
           <p className="text-sm text-muted-foreground">
-            Free public WebSockets only. Polymarket keys are optional until you place live orders.
+            Collect 1m/5m/15m bars for BTC, ETH, XRP, and other majors at the same time. Polymarket keys stay optional until you place live orders.
           </p>
         </div>
       </div>
@@ -121,14 +131,41 @@ export function SetupPage() {
       </Card>
       <Card>
         <CardHeader>
+          <CardTitle>Coins</CardTitle>
+          <CardDescription>
+            Every selected coin is collected simultaneously so each timeframe gets more labeled rows.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <AssetFields assets={universe?.assets ?? []} selected={coins} onChange={setCoins} />
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>Timeframes</CardTitle>
+          <CardDescription>
+            1-minute bars label after one minute (next-bar). Use that to test a starter model before waiting on 15-minute labels.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <TimeframeFields
+            timeframes={universe?.timeframes ?? []}
+            selected={timeframes}
+            onChange={setTimeframes}
+          />
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
           <CardTitle>Feature bars &amp; risk</CardTitle>
           <CardDescription>How often to snapshot features and when an order is allowed.</CardDescription>
         </CardHeader>
         <CardContent>
           <FieldGroup>
             <Field>
-              <FieldLabel htmlFor="bar">Bar interval (seconds)</FieldLabel>
+              <FieldLabel htmlFor="bar">Optional micro snapshot (seconds)</FieldLabel>
               <Input id="bar" value={barSec} onChange={(e) => setBarSec(e.target.value)} />
+              <FieldDescription>0 = off. The 1m/5m/15m/1h boxes above are the main training bars.</FieldDescription>
             </Field>
             <Field>
               <FieldLabel htmlFor="edge">Minimum edge vs Polymarket yes-price</FieldLabel>

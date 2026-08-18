@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import timedelta
+from django.db.models import Count, Q
 
 from django.conf import settings
 from django.utils import timezone
@@ -27,6 +27,7 @@ from pipeline.models import (
 from pipeline.procutil import running_pid, stop_pid, write_pid
 from pipeline.store import DEFAULTS, all_settings_public, apply_settings, get_setting, set_setting
 from pipeline.trading.markets import btc_15m_slug, current_window_start
+from pipeline.universe import TIMEFRAMES, normalize_assets, universe_payload
 from pipeline.trading.orders import maybe_place
 
 import subprocess
@@ -71,13 +72,22 @@ def bootstrap(request):
     settings_public = all_settings_public()
     latest_bar = FeatureBar.objects.order_by("-ts").first()
     market = PolyMarketWindow.objects.order_by("-start_ts").first()
+    breakdown = list(
+        FeatureBar.objects.values("asset", "interval_seconds").annotate(
+            bars=Count("id"),
+            labeled_15m=Count("id", filter=Q(label_up_15m__isnull=False)),
+            labeled_next=Count("id", filter=Q(label_up_next__isnull=False)),
+        )
+    )
     counts = {
         "bars": FeatureBar.objects.count(),
         "labeled": FeatureBar.objects.filter(label_up_15m__isnull=False).count(),
+        "labeled_next": FeatureBar.objects.filter(label_up_next__isnull=False).count(),
         "ticks": LiveTick.objects.count(),
         "predictions": Prediction.objects.count(),
         "orders": TradeOrder.objects.count(),
         "jobs": TrainingJob.objects.count(),
+        "by_asset_interval": breakdown,
     }
     sources = []
     db_sources = {s.name: s for s in CollectorSource.objects.all()}
@@ -101,6 +111,7 @@ def bootstrap(request):
             "sources_catalog": FREE_SOURCES,
             "sources": sources,
             "architectures": MODEL_ARCHES,
+            "universe": universe_payload(),
             "collector": _hb("collector"),
             "inference": _hb("inference"),
             "counts": counts,
@@ -114,7 +125,7 @@ def bootstrap(request):
 @api_view(["GET", "POST"])
 def setup_view(request):
     if request.method == "GET":
-        return Response({"settings": all_settings_public(), "defaults": {k: v for k, v in DEFAULTS.items() if k not in {"polymarket_private_key", "polymarket_api_secret", "polymarket_api_passphrase"}}, "sources": FREE_SOURCES})
+        return Response({"settings": all_settings_public(), "defaults": {k: v for k, v in DEFAULTS.items() if k not in {"polymarket_private_key", "polymarket_api_secret", "polymarket_api_passphrase"}}, "sources": FREE_SOURCES, "universe": universe_payload()})
     data = request.data if isinstance(request.data, dict) else {}
     public = apply_settings(data)
     set_setting("setup_complete", True)
@@ -174,6 +185,7 @@ def live(request):
                 {
                     "ts_ms": t.ts_ms,
                     "venue": t.venue,
+                    "asset": t.asset,
                     "price": t.price,
                     "size": t.size,
                     "is_buyer_maker": t.is_buyer_maker,
@@ -191,9 +203,16 @@ def live(request):
 
 @api_view(["POST"])
 def backfill(request):
-    days = int((request.data or {}).get("days") or 7)
-    interval = str((request.data or {}).get("interval") or "1m")
-    result = backfill_binance(days=days, interval=interval)
+    data = request.data or {}
+    days = int(data.get("days") or 7)
+    interval = data.get("interval")
+    intervals = data.get("intervals")
+    assets = data.get("assets")
+    if isinstance(intervals, str):
+        intervals = [part.strip() for part in intervals.split(",") if part.strip()]
+    if isinstance(assets, str):
+        assets = [part.strip() for part in assets.split(",") if part.strip()]
+    result = backfill_binance(days=days, interval=interval, intervals=intervals, assets=assets)
     return Response({"ok": True, **result})
 
 
@@ -209,13 +228,29 @@ def train_view(request):
         return Response({"jobs": [_job_payload(j) for j in jobs]})
     data = request.data if isinstance(request.data, dict) else {}
     arches = data.get("architectures") or [a["id"] for a in MODEL_ARCHES]
+    label = str(data.get("label") or "next")
+    label_field = "label_up_next" if label == "next" else "label_up_15m"
+    interval_seconds = data.get("interval_seconds")
+    if interval_seconds is None and data.get("timeframe"):
+        interval_seconds = TIMEFRAMES.get(str(data.get("timeframe")))
+    if interval_seconds is None:
+        interval_seconds = 60
+    assets = data.get("assets")
+    if data.get("pool_assets") is False and not assets:
+        assets = ["BTC"]
+    elif assets:
+        assets = normalize_assets(assets)
     job = TrainingJob.objects.create(
         status="pending",
         config={
             "architectures": arches,
             "min_rows": int(data.get("min_rows") or 200),
             "folds": int(data.get("folds") or 5),
-            "interval_seconds": data.get("interval_seconds"),
+            "interval_seconds": int(interval_seconds) if interval_seconds else None,
+            "timeframe": str(data.get("timeframe") or ""),
+            "label": label,
+            "label_field": label_field,
+            "assets": assets,
             "min_auc": float(data.get("min_auc") or get_setting("min_auc") or 0.52),
         },
     )
@@ -290,9 +325,11 @@ def _bar_payload(bar: FeatureBar | None) -> dict | None:
     feats = bar.features or {}
     return {
         "ts": bar.ts,
+        "asset": bar.asset,
         "interval_seconds": bar.interval_seconds,
         "mid_price": bar.mid_price,
         "label_up_15m": bar.label_up_15m,
+        "label_up_next": bar.label_up_next,
         "features": feats,
         "train_features": training_vector(feats),
         "n_features": len(training_vector(feats)),

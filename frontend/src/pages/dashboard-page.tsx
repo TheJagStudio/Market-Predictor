@@ -58,7 +58,7 @@ export function DashboardPage() {
         <div className="flex flex-col gap-1">
           <h1 className="text-lg font-medium">Dashboard</h1>
           <p className="text-sm text-muted-foreground">
-            Live free-data snapshot for the current Polymarket 15-minute BTC window.
+            Live free-data snapshot across selected coins. Trading still targets the BTC 15-minute Polymarket window.
           </p>
         </div>
         <div className="flex gap-2">
@@ -85,14 +85,16 @@ export function DashboardPage() {
         />
         <Stat
           title="Labeled bars"
-          value={String(boot?.counts.labeled ?? 0)}
-          hint={`${boot?.counts.bars ?? 0} total bars`}
+          value={String((boot?.counts.labeled_next ?? 0) + (boot?.counts.labeled ?? 0))}
+          hint={`${boot?.counts.labeled_next ?? 0} next-bar · ${boot?.counts.labeled ?? 0} 15m · ${boot?.counts.bars ?? 0} total`}
         />
       </div>
       <Card>
         <CardHeader>
           <CardTitle>Recent mid price</CardTitle>
-          <CardDescription>Feature bars written by the collector.</CardDescription>
+          <CardDescription>
+            Latest bars from the collector. {boot?.latest_bar?.asset ?? "BTC"} {boot?.latest_bar?.interval_seconds ?? ""}s
+          </CardDescription>
         </CardHeader>
         <CardContent>
           {bars.length ? (

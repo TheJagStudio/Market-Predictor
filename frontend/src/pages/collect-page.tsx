@@ -45,7 +45,10 @@ export function CollectPage() {
   async function backfill() {
     setBusy(true)
     try {
-      const result = await postBackfill(Number(days), "1m")
+      const result = await postBackfill(Number(days), {
+        assets: (boot?.settings.enabled_assets as string[] | undefined) ?? boot?.universe?.enabled_assets,
+        intervals: (boot?.settings.bar_timeframes as string[] | undefined) ?? boot?.universe?.enabled_timeframes,
+      })
       toast.success(`Backfilled ${result.fetched} klines (${result.created} new bars)`)
       await refresh()
     } catch (err) {
@@ -61,7 +64,7 @@ export function CollectPage() {
         <div className="flex flex-col gap-1">
           <h1 className="text-lg font-medium">Data collection</h1>
           <p className="text-sm text-muted-foreground">
-            24/7 multi-venue WebSockets plus a free Binance kline backfill so training can start today.
+            24/7 multi-venue WebSockets for every selected coin, plus a free Binance kline backfill across 1m/5m/15m/1h.
           </p>
         </div>
         <Button onClick={toggle}>
@@ -72,8 +75,7 @@ export function CollectPage() {
       <Alert>
         <AlertTitle>Two layers of data</AlertTitle>
         <AlertDescription>
-          Live streams build microstructure features (TFI, VPIN, order-book imbalance). Backfill adds
-          1-minute OHLC history so you can train price-only models immediately.
+          Live streams build microstructure features (TFI, VPIN, order-book imbalance) for BTC, ETH, XRP, and the rest of your universe. Backfill adds OHLC history on every selected timeframe so you can train a 1-minute starter model today.
         </AlertDescription>
       </Alert>
       <Card>
@@ -84,7 +86,7 @@ export function CollectPage() {
         <CardContent className="flex flex-col gap-3">
           <FieldGroup>
             <Field>
-              <FieldLabel htmlFor="days">Days of 1-minute BTCUSDT history</FieldLabel>
+              <FieldLabel htmlFor="days">Days of history for every selected coin and timeframe</FieldLabel>
               <Input id="days" value={days} onChange={(e) => setDays(e.target.value)} />
             </Field>
           </FieldGroup>
@@ -92,6 +94,38 @@ export function CollectPage() {
             <DatabaseIcon data-icon="inline-start" />
             Run backfill
           </Button>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>Bars by coin and timeframe</CardTitle>
+          <CardDescription>
+            Next-bar labels appear one interval later. 15-minute labels need a 15-minute future price.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Coin</TableHead>
+                <TableHead>Timeframe</TableHead>
+                <TableHead>Bars</TableHead>
+                <TableHead>Next-bar labels</TableHead>
+                <TableHead>15m labels</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {(boot?.counts.by_asset_interval ?? []).map((row) => (
+                <TableRow key={`${row.asset}-${row.interval_seconds}`}>
+                  <TableCell>{row.asset}</TableCell>
+                  <TableCell>{secondsToTf(row.interval_seconds)}</TableCell>
+                  <TableCell>{row.bars}</TableCell>
+                  <TableCell>{row.labeled_next}</TableCell>
+                  <TableCell>{row.labeled_15m}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
         </CardContent>
       </Card>
       <Card>
@@ -138,6 +172,7 @@ export function CollectPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Venue</TableHead>
+                <TableHead>Coin</TableHead>
                 <TableHead>Price</TableHead>
                 <TableHead>Size</TableHead>
                 <TableHead>Side</TableHead>
@@ -147,6 +182,7 @@ export function CollectPage() {
               {(live?.ticks ?? []).slice(0, 12).map((tick) => (
                 <TableRow key={`${tick.venue}-${tick.ts_ms}-${tick.price}`}>
                   <TableCell>{tick.venue}</TableCell>
+                  <TableCell>{tick.asset ?? "—"}</TableCell>
                   <TableCell>{tick.price?.toFixed(2)}</TableCell>
                   <TableCell>{tick.size?.toFixed(4)}</TableCell>
                   <TableCell>{tick.is_buyer_maker ? "sell" : "buy"}</TableCell>
@@ -158,4 +194,9 @@ export function CollectPage() {
       </Card>
     </div>
   )
+}
+
+function secondsToTf(seconds: number) {
+  const map: Record<number, string> = { 60: "1m", 300: "5m", 900: "15m", 3600: "1h" }
+  return map[seconds] ?? `${seconds}s`
 }
