@@ -1,4 +1,4 @@
-"""Free public WebSocket + REST collectors. No paid APIs."""
+"""Free public WebSocket + REST collectors. No paid APIs. Multi-coin streams."""
 
 from __future__ import annotations
 
@@ -11,6 +11,19 @@ from typing import Any
 import aiohttp
 
 from pipeline.ingest.wsutil import parse_json, run_forever
+from pipeline.universe import (
+    asset_from_binance,
+    asset_from_bitstamp,
+    asset_from_bybit,
+    asset_from_coinbase,
+    asset_from_coincap,
+    asset_from_deribit,
+    asset_from_kraken,
+    asset_from_okx,
+    runtime_assets,
+    runtime_klines,
+    symbols_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +34,37 @@ def _ts() -> float:
     return time.time()
 
 
-async def emit(bus: asyncio.Queue, venue: str, kind: str, data: dict[str, Any], ts: float | None = None) -> None:
-    event = {"venue": venue, "kind": kind, "ts": ts if ts is not None else _ts(), "data": data}
+def _assets(assets: list[str] | None) -> list[str]:
+    return [a.upper() for a in assets] if assets else runtime_assets()
+
+
+def _klines() -> list[str]:
+    return [tf for tf in runtime_klines() if tf in {"1m", "5m", "15m", "1h"}]
+
+
+def _chunks(items: list[str], size: int = 40) -> list[list[str]]:
+    if not items:
+        return []
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+async def emit(
+    bus: asyncio.Queue,
+    venue: str,
+    kind: str,
+    data: dict[str, Any],
+    ts: float | None = None,
+    asset: str = "BTC",
+) -> None:
+    payload = dict(data)
+    payload.setdefault("asset", asset)
+    event = {
+        "venue": venue,
+        "kind": kind,
+        "ts": ts if ts is not None else _ts(),
+        "asset": asset,
+        "data": payload,
+    }
     try:
         bus.put_nowait(event)
     except asyncio.QueueFull:
@@ -33,18 +75,16 @@ async def emit(bus: asyncio.Queue, venue: str, kind: str, data: dict[str, Any], 
         bus.put_nowait(event)
 
 
-async def binance_spot(bus: asyncio.Queue) -> None:
-    streams = "/".join(
-        [
-            "btcusdt@trade",
-            "btcusdt@depth20@100ms",
-            "btcusdt@bookTicker",
-            "btcusdt@kline_1m",
-            "btcusdt@kline_5m",
-            "btcusdt@kline_15m",
-        ]
-    )
-    url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+async def binance_spot(bus: asyncio.Queue, assets: list[str] | None = None) -> None:
+    coins = _assets(assets)
+    klines = _klines() or ["1m", "5m", "15m"]
+    streams: list[str] = []
+    for asset, symbol in symbols_for("binance", coins):
+        sym = symbol.lower()
+        depth = "100ms" if asset == "BTC" else "1000ms"
+        streams.extend([f"{sym}@trade", f"{sym}@bookTicker", f"{sym}@depth20@{depth}"])
+        for interval in klines:
+            streams.append(f"{sym}@kline_{interval}")
 
     async def on_message(_ws: Any, raw: str) -> None:
         msg = parse_json(raw)
@@ -52,7 +92,8 @@ async def binance_spot(bus: asyncio.Queue) -> None:
             return
         payload = msg.get("data") or msg
         stream = str(msg.get("stream") or "")
-        if "trade" in stream:
+        asset = asset_from_binance(stream) or "BTC"
+        if "trade" in stream and "aggTrade" not in stream:
             await emit(
                 bus,
                 "binance_spot",
@@ -64,9 +105,16 @@ async def binance_spot(bus: asyncio.Queue) -> None:
                     "id": payload.get("t"),
                 },
                 ts=float(payload.get("T", time.time() * 1000)) / 1000.0,
+                asset=asset,
             )
         elif "depth20" in stream:
-            await emit(bus, "binance_spot", "book", {"bids": payload.get("bids") or [], "asks": payload.get("asks") or []})
+            await emit(
+                bus,
+                "binance_spot",
+                "book",
+                {"bids": payload.get("bids") or [], "asks": payload.get("asks") or []},
+                asset=asset,
+            )
         elif "bookTicker" in stream:
             await emit(
                 bus,
@@ -78,39 +126,51 @@ async def binance_spot(bus: asyncio.Queue) -> None:
                     "bid_sz": float(payload["B"]),
                     "ask_sz": float(payload["A"]),
                 },
+                asset=asset,
             )
         elif "kline" in stream:
             k = payload.get("k") or {}
             if k.get("x"):
-                interval = k.get("i")
                 await emit(
                     bus,
                     "binance_spot",
                     "kline",
                     {
-                        "interval": interval,
+                        "interval": k.get("i"),
                         "close": float(k["c"]),
                         "volume": float(k["v"]),
                         "open": float(k["o"]),
                         "high": float(k["h"]),
                         "low": float(k["l"]),
+                        "open_time": int(k.get("t") or 0),
                     },
+                    asset=asset,
                 )
 
-    await run_forever(url, on_message=on_message)
+    tasks = [
+        run_forever(f"wss://stream.binance.com:9443/stream?streams={'/'.join(chunk)}", on_message=on_message)
+        for chunk in _chunks(streams, 45)
+    ]
+    if not tasks:
+        await asyncio.sleep(5)
+        return
+    await asyncio.gather(*tasks)
 
 
-async def binance_futures(bus: asyncio.Queue) -> None:
-    streams = "/".join(
-        [
-            "btcusdt@aggTrade",
-            "btcusdt@depth20@100ms",
-            "btcusdt@markPrice@1s",
-            "btcusdt@forceOrder",
-            "btcusdt@kline_1m",
-        ]
-    )
-    url = f"wss://fstream.binance.com/stream?streams={streams}"
+async def binance_futures(bus: asyncio.Queue, assets: list[str] | None = None) -> None:
+    coins = _assets(assets)
+    streams: list[str] = []
+    for _asset, symbol in symbols_for("binance", coins):
+        sym = symbol.lower()
+        streams.extend(
+            [
+                f"{sym}@aggTrade",
+                f"{sym}@depth20@1000ms",
+                f"{sym}@markPrice@1s",
+                f"{sym}@forceOrder",
+                f"{sym}@kline_1m",
+            ]
+        )
 
     async def on_message(_ws: Any, raw: str) -> None:
         msg = parse_json(raw)
@@ -118,6 +178,7 @@ async def binance_futures(bus: asyncio.Queue) -> None:
             return
         payload = msg.get("data") or msg
         stream = str(msg.get("stream") or "")
+        asset = asset_from_binance(stream or str(payload.get("s") or "")) or "BTC"
         if "aggTrade" in stream:
             await emit(
                 bus,
@@ -129,9 +190,16 @@ async def binance_futures(bus: asyncio.Queue) -> None:
                     "is_buyer_maker": bool(payload.get("m")),
                 },
                 ts=float(payload.get("T", time.time() * 1000)) / 1000.0,
+                asset=asset,
             )
         elif "depth20" in stream:
-            await emit(bus, "binance_futures", "book", {"bids": payload.get("b") or payload.get("bids") or [], "asks": payload.get("a") or payload.get("asks") or []})
+            await emit(
+                bus,
+                "binance_futures",
+                "book",
+                {"bids": payload.get("b") or payload.get("bids") or [], "asks": payload.get("a") or payload.get("asks") or []},
+                asset=asset,
+            )
         elif "markPrice" in stream:
             await emit(
                 bus,
@@ -142,29 +210,53 @@ async def binance_futures(bus: asyncio.Queue) -> None:
                     "index": float(payload.get("i") or 0),
                     "funding": float(payload.get("r") or 0),
                 },
+                asset=asset,
             )
         elif "forceOrder" in stream:
             o = payload.get("o") or payload
             qty = float(o.get("q") or o.get("l") or 0)
             price = float(o.get("p") or o.get("ap") or 0)
-            await emit(bus, "binance_futures", "liq", {"notional": abs(qty * price), "side": o.get("S")})
+            sym = str(o.get("s") or payload.get("s") or "")
+            liq_asset = asset_from_binance(sym) or asset
+            await emit(bus, "binance_futures", "liq", {"notional": abs(qty * price), "side": o.get("S")}, asset=liq_asset)
         elif "kline" in stream:
             k = payload.get("k") or {}
             if k.get("x"):
-                await emit(bus, "binance_futures", "kline", {"interval": k.get("i"), "close": float(k["c"]), "volume": float(k["v"])})
+                await emit(
+                    bus,
+                    "binance_futures",
+                    "kline",
+                    {
+                        "interval": k.get("i"),
+                        "close": float(k["c"]),
+                        "volume": float(k["v"]),
+                        "open_time": int(k.get("t") or 0),
+                    },
+                    asset=asset,
+                )
 
-    await run_forever(url, on_message=on_message)
+    tasks = [
+        run_forever(f"wss://fstream.binance.com/stream?streams={'/'.join(chunk)}", on_message=on_message)
+        for chunk in _chunks(streams, 40)
+    ]
+    if not tasks:
+        await asyncio.sleep(5)
+        return
+    await asyncio.gather(*tasks)
 
 
-async def coinbase(bus: asyncio.Queue) -> None:
+async def coinbase(bus: asyncio.Queue, assets: list[str] | None = None) -> None:
     url = "wss://ws-feed.exchange.coinbase.com"
+    products = [symbol for _asset, symbol in symbols_for("coinbase", _assets(assets))]
 
     async def on_open(ws: Any) -> None:
+        if not products:
+            return
         await ws.send(
             json.dumps(
                 {
                     "type": "subscribe",
-                    "product_ids": ["BTC-USD"],
+                    "product_ids": products,
                     "channels": ["matches", "ticker", "level2_batch"],
                 }
             )
@@ -175,6 +267,7 @@ async def coinbase(bus: asyncio.Queue) -> None:
         if not isinstance(msg, dict):
             return
         typ = msg.get("type")
+        asset = asset_from_coinbase(str(msg.get("product_id") or "")) or "BTC"
         if typ in {"match", "last_match"}:
             side = str(msg.get("side") or "").lower()
             await emit(
@@ -186,6 +279,7 @@ async def coinbase(bus: asyncio.Queue) -> None:
                     "size": float(msg["size"]),
                     "is_buyer_maker": side == "sell",
                 },
+                asset=asset,
             )
         elif typ == "ticker":
             await emit(
@@ -197,24 +291,34 @@ async def coinbase(bus: asyncio.Queue) -> None:
                     "ask": float(msg.get("best_ask") or 0),
                     "price": float(msg.get("price") or 0),
                 },
+                asset=asset,
             )
         elif typ in {"snapshot", "l2update", "level2"}:
             if "bids" in msg or "asks" in msg:
-                await emit(bus, "coinbase", "book", {"bids": msg.get("bids") or [], "asks": msg.get("asks") or [], "snapshot": typ == "snapshot"})
+                await emit(
+                    bus,
+                    "coinbase",
+                    "book",
+                    {"bids": msg.get("bids") or [], "asks": msg.get("asks") or [], "snapshot": typ == "snapshot"},
+                    asset=asset,
+                )
             changes = msg.get("changes") or []
             if changes:
-                await emit(bus, "coinbase", "book_delta", {"changes": changes})
+                await emit(bus, "coinbase", "book_delta", {"changes": changes}, asset=asset)
 
     await run_forever(url, on_open=on_open, on_message=on_message)
 
 
-async def kraken(bus: asyncio.Queue) -> None:
+async def kraken(bus: asyncio.Queue, assets: list[str] | None = None) -> None:
     url = "wss://ws.kraken.com/v2"
+    symbols = [symbol for _asset, symbol in symbols_for("kraken", _assets(assets))]
 
     async def on_open(ws: Any) -> None:
-        await ws.send(json.dumps({"method": "subscribe", "params": {"channel": "trade", "symbol": ["BTC/USD"]}}))
-        await ws.send(json.dumps({"method": "subscribe", "params": {"channel": "ticker", "symbol": ["BTC/USD"]}}))
-        await ws.send(json.dumps({"method": "subscribe", "params": {"channel": "book", "symbol": ["BTC/USD"], "depth": 10}}))
+        if not symbols:
+            return
+        await ws.send(json.dumps({"method": "subscribe", "params": {"channel": "trade", "symbol": symbols}}))
+        await ws.send(json.dumps({"method": "subscribe", "params": {"channel": "ticker", "symbol": symbols}}))
+        await ws.send(json.dumps({"method": "subscribe", "params": {"channel": "book", "symbol": symbols, "depth": 10}}))
 
     async def on_message(_ws: Any, raw: str) -> None:
         msg = parse_json(raw)
@@ -224,6 +328,7 @@ async def kraken(bus: asyncio.Queue) -> None:
         data = msg.get("data") or []
         if channel == "trade":
             for trade in data:
+                asset = asset_from_kraken(str(trade.get("symbol") or "")) or "BTC"
                 side = str(trade.get("side") or "").lower()
                 await emit(
                     bus,
@@ -234,9 +339,11 @@ async def kraken(bus: asyncio.Queue) -> None:
                         "size": float(trade["qty"]),
                         "is_buyer_maker": side == "sell",
                     },
+                    asset=asset,
                 )
         elif channel == "ticker" and data:
             t = data[0]
+            asset = asset_from_kraken(str(t.get("symbol") or "")) or "BTC"
             await emit(
                 bus,
                 "kraken",
@@ -246,9 +353,11 @@ async def kraken(bus: asyncio.Queue) -> None:
                     "ask": float((t.get("ask") or 0)),
                     "price": float(t.get("last") or 0),
                 },
+                asset=asset,
             )
         elif channel == "book" and data:
             book = data[0]
+            asset = asset_from_kraken(str(book.get("symbol") or "")) or "BTC"
             await emit(
                 bus,
                 "kraken",
@@ -258,23 +367,21 @@ async def kraken(bus: asyncio.Queue) -> None:
                     "asks": [[x["price"], x["qty"]] for x in book.get("asks") or []],
                     "snapshot": msg.get("type") == "snapshot",
                 },
+                asset=asset,
             )
 
     await run_forever(url, on_message=on_message, on_open=on_open)
 
 
-async def bybit(bus: asyncio.Queue) -> None:
+async def bybit(bus: asyncio.Queue, assets: list[str] | None = None) -> None:
     url = "wss://stream.bybit.com/v5/public/linear"
+    args: list[str] = []
+    for _asset, symbol in symbols_for("bybit", _assets(assets)):
+        args.extend([f"publicTrade.{symbol}", f"orderbook.50.{symbol}", f"tickers.{symbol}"])
 
     async def on_open(ws: Any) -> None:
-        await ws.send(
-            json.dumps(
-                {
-                    "op": "subscribe",
-                    "args": ["publicTrade.BTCUSDT", "orderbook.50.BTCUSDT", "tickers.BTCUSDT"],
-                }
-            )
-        )
+        for chunk in _chunks(args, 20):
+            await ws.send(json.dumps({"op": "subscribe", "args": chunk}))
 
     async def on_message(_ws: Any, raw: str) -> None:
         msg = parse_json(raw)
@@ -282,6 +389,7 @@ async def bybit(bus: asyncio.Queue) -> None:
             return
         topic = str(msg.get("topic") or "")
         data = msg.get("data")
+        asset = asset_from_bybit(topic) or "BTC"
         if topic.startswith("publicTrade") and isinstance(data, list):
             for trade in data:
                 await emit(
@@ -293,6 +401,7 @@ async def bybit(bus: asyncio.Queue) -> None:
                         "size": float(trade["v"]),
                         "is_buyer_maker": str(trade.get("S") or "").lower() == "sell",
                     },
+                    asset=asset,
                 )
         elif topic.startswith("orderbook") and isinstance(data, dict):
             await emit(
@@ -304,6 +413,7 @@ async def bybit(bus: asyncio.Queue) -> None:
                     "asks": data.get("a") or [],
                     "snapshot": msg.get("type") == "snapshot",
                 },
+                asset=asset,
             )
         elif topic.startswith("tickers") and isinstance(data, dict):
             funding = data.get("fundingRate")
@@ -318,23 +428,29 @@ async def bybit(bus: asyncio.Queue) -> None:
                     "funding": float(funding) if funding not in (None, "") else None,
                     "oi": float(data["openInterest"]) if data.get("openInterest") else None,
                 },
+                asset=asset,
             )
 
     await run_forever(url, on_message=on_message, on_open=on_open)
 
 
-async def okx(bus: asyncio.Queue) -> None:
+async def okx(bus: asyncio.Queue, assets: list[str] | None = None) -> None:
     url = "wss://ws.okx.com:8443/ws/v5/public"
+    args: list[dict[str, str]] = []
+    for _asset, symbol in symbols_for("okx", _assets(assets)):
+        args.extend([{"channel": "trades", "instId": symbol}, {"channel": "books5", "instId": symbol}])
+    for _asset, symbol in symbols_for("okx_swap", _assets(assets)):
+        args.extend(
+            [
+                {"channel": "trades", "instId": symbol},
+                {"channel": "books5", "instId": symbol},
+                {"channel": "funding-rate", "instId": symbol},
+            ]
+        )
 
     async def on_open(ws: Any) -> None:
-        args = [
-            {"channel": "trades", "instId": "BTC-USDT"},
-            {"channel": "books5", "instId": "BTC-USDT"},
-            {"channel": "trades", "instId": "BTC-USDT-SWAP"},
-            {"channel": "books5", "instId": "BTC-USDT-SWAP"},
-            {"channel": "funding-rate", "instId": "BTC-USDT-SWAP"},
-        ]
-        await ws.send(json.dumps({"op": "subscribe", "args": args}))
+        for i in range(0, len(args), 20):
+            await ws.send(json.dumps({"op": "subscribe", "args": args[i : i + 20]}))
 
     async def on_message(_ws: Any, raw: str) -> None:
         msg = parse_json(raw)
@@ -343,7 +459,8 @@ async def okx(bus: asyncio.Queue) -> None:
         arg = msg.get("arg") or {}
         channel = arg.get("channel")
         inst = arg.get("instId")
-        venue = "okx_swap" if inst and "SWAP" in inst else "okx_spot"
+        asset = asset_from_okx(str(inst or "")) or "BTC"
+        venue = "okx_swap" if inst and "SWAP" in str(inst) else "okx_spot"
         data = msg.get("data") or []
         if channel == "trades":
             for trade in data:
@@ -356,6 +473,7 @@ async def okx(bus: asyncio.Queue) -> None:
                         "size": float(trade["sz"]),
                         "is_buyer_maker": str(trade.get("side") or "").lower() == "sell",
                     },
+                    asset=asset,
                 )
         elif channel == "books5":
             for book in data:
@@ -364,19 +482,22 @@ async def okx(bus: asyncio.Queue) -> None:
                     venue,
                     "book",
                     {"bids": book.get("bids") or [], "asks": book.get("asks") or [], "snapshot": True},
+                    asset=asset,
                 )
         elif channel == "funding-rate" and data:
-            await emit(bus, "okx_swap", "funding", {"funding": float(data[0].get("fundingRate") or 0)})
+            await emit(bus, "okx_swap", "funding", {"funding": float(data[0].get("fundingRate") or 0)}, asset=asset)
 
     await run_forever(url, on_message=on_message, on_open=on_open)
 
 
-async def bitstamp(bus: asyncio.Queue) -> None:
+async def bitstamp(bus: asyncio.Queue, assets: list[str] | None = None) -> None:
     url = "wss://ws.bitstamp.net"
+    pairs = [symbol for _asset, symbol in symbols_for("bitstamp", _assets(assets))]
 
     async def on_open(ws: Any) -> None:
-        await ws.send(json.dumps({"event": "bts:subscribe", "data": {"channel": "live_trades_btcusd"}}))
-        await ws.send(json.dumps({"event": "bts:subscribe", "data": {"channel": "order_book_btcusd"}}))
+        for pair in pairs:
+            await ws.send(json.dumps({"event": "bts:subscribe", "data": {"channel": f"live_trades_{pair}"}}))
+            await ws.send(json.dumps({"event": "bts:subscribe", "data": {"channel": f"order_book_{pair}"}}))
 
     async def on_message(_ws: Any, raw: str) -> None:
         msg = parse_json(raw)
@@ -384,6 +505,7 @@ async def bitstamp(bus: asyncio.Queue) -> None:
             return
         event = msg.get("event")
         data = msg.get("data") or {}
+        asset = asset_from_bitstamp(str(msg.get("channel") or "")) or "BTC"
         if event == "trade":
             await emit(
                 bus,
@@ -394,30 +516,42 @@ async def bitstamp(bus: asyncio.Queue) -> None:
                     "size": float(data["amount"]),
                     "is_buyer_maker": str(data.get("type")) == "1",
                 },
+                asset=asset,
             )
         elif event == "data" and (data.get("bids") or data.get("asks")):
-            await emit(bus, "bitstamp", "book", {"bids": data.get("bids") or [], "asks": data.get("asks") or [], "snapshot": True})
+            await emit(
+                bus,
+                "bitstamp",
+                "book",
+                {"bids": data.get("bids") or [], "asks": data.get("asks") or [], "snapshot": True},
+                asset=asset,
+            )
 
     await run_forever(url, on_message=on_message, on_open=on_open)
 
 
-async def deribit(bus: asyncio.Queue) -> None:
+async def deribit(bus: asyncio.Queue, assets: list[str] | None = None) -> None:
     url = "wss://www.deribit.com/ws/api/v2"
+    channels: list[str] = []
+    for _asset, instrument in symbols_for("deribit", _assets(assets)):
+        channels.extend(
+            [
+                f"trades.{instrument}.100ms",
+                f"book.{instrument}.none.10.100ms",
+                f"ticker.{instrument}.100ms",
+            ]
+        )
 
     async def on_open(ws: Any) -> None:
+        if not channels:
+            return
         await ws.send(
             json.dumps(
                 {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "public/subscribe",
-                    "params": {
-                        "channels": [
-                            "trades.BTC-PERPETUAL.100ms",
-                            "book.BTC-PERPETUAL.none.10.100ms",
-                            "ticker.BTC-PERPETUAL.100ms",
-                        ]
-                    },
+                    "params": {"channels": channels},
                 }
             )
         )
@@ -429,6 +563,7 @@ async def deribit(bus: asyncio.Queue) -> None:
         params = msg.get("params") or {}
         channel = str(params.get("channel") or "")
         data = params.get("data")
+        asset = asset_from_deribit(channel) or "BTC"
         if channel.startswith("trades") and isinstance(data, list):
             for trade in data:
                 await emit(
@@ -440,11 +575,22 @@ async def deribit(bus: asyncio.Queue) -> None:
                         "size": float(trade.get("amount") or 0) / max(float(trade["price"]), 1.0),
                         "is_buyer_maker": str(trade.get("direction") or "").lower() == "sell",
                     },
+                    asset=asset,
                 )
         elif channel.startswith("book") and isinstance(data, dict):
             bids = data.get("bids") or []
             asks = data.get("asks") or []
-            await emit(bus, "deribit", "book", {"bids": [x[-2:] for x in bids] if bids and len(bids[0]) > 2 else bids, "asks": [x[-2:] for x in asks] if asks and len(asks[0]) > 2 else asks, "snapshot": True})
+            await emit(
+                bus,
+                "deribit",
+                "book",
+                {
+                    "bids": [x[-2:] for x in bids] if bids and len(bids[0]) > 2 else bids,
+                    "asks": [x[-2:] for x in asks] if asks and len(asks[0]) > 2 else asks,
+                    "snapshot": True,
+                },
+                asset=asset,
+            )
         elif channel.startswith("ticker") and isinstance(data, dict):
             await emit(
                 bus,
@@ -456,22 +602,25 @@ async def deribit(bus: asyncio.Queue) -> None:
                     "price": float(data.get("last_price") or data.get("mark_price") or 0),
                     "funding": float(data["current_funding"]) if data.get("current_funding") is not None else None,
                 },
+                asset=asset,
             )
 
     await run_forever(url, on_message=on_message, on_open=on_open)
 
 
-async def coincap(bus: asyncio.Queue) -> None:
-    url = "wss://ws.coincap.io/prices?assets=bitcoin"
+async def coincap(bus: asyncio.Queue, assets: list[str] | None = None) -> None:
+    ids = [symbol for _asset, symbol in symbols_for("coincap", _assets(assets))]
+    url = "wss://ws.coincap.io/prices?assets=" + ",".join(ids or ["bitcoin"])
 
     async def on_message(_ws: Any, raw: str) -> None:
         msg = parse_json(raw)
         if not isinstance(msg, dict):
             return
-        price = msg.get("bitcoin")
-        if price is None:
-            return
-        await emit(bus, "coincap", "ticker", {"price": float(price)})
+        for coin_id, price in msg.items():
+            asset = asset_from_coincap(str(coin_id))
+            if not asset or price is None:
+                continue
+            await emit(bus, "coincap", "ticker", {"price": float(price)}, asset=asset)
 
     await run_forever(url, on_message=on_message)
 
@@ -521,15 +670,16 @@ async def polymarket_clob(bus: asyncio.Queue, token_provider) -> None:
     await runner()
 
 
-async def rest_aux(bus: asyncio.Queue) -> None:
+async def rest_aux(bus: asyncio.Queue, assets: list[str] | None = None) -> None:
+    coins = _assets(assets)
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             try:
                 await _poll_fng(session, bus)
                 await _poll_mempool(session, bus)
-                await _poll_oi(session, bus)
-                await _poll_mtf(session, bus)
+                await _poll_oi(session, bus, coins)
+                await _poll_mtf(session, bus, coins)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -544,7 +694,7 @@ async def _poll_fng(session: aiohttp.ClientSession, bus: asyncio.Queue) -> None:
         data = await resp.json()
         rows = data.get("data") or []
         if rows:
-            await emit(bus, "rest_aux", "fng", {"value": float(rows[0]["value"])})
+            await emit(bus, "rest_aux", "fng", {"value": float(rows[0]["value"])}, asset="*")
 
 
 async def _poll_mempool(session: aiohttp.ClientSession, bus: asyncio.Queue) -> None:
@@ -552,27 +702,36 @@ async def _poll_mempool(session: aiohttp.ClientSession, bus: asyncio.Queue) -> N
         if resp.status != 200:
             return
         data = await resp.json()
-        await emit(bus, "rest_aux", "mempool", {"fastestFee": float(data.get("fastestFee") or 0)})
+        await emit(bus, "rest_aux", "mempool", {"fastestFee": float(data.get("fastestFee") or 0)}, asset="BTC")
 
 
-async def _poll_oi(session: aiohttp.ClientSession, bus: asyncio.Queue) -> None:
-    async with session.get("https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT") as resp:
-        if resp.status != 200:
-            return
-        data = await resp.json()
-        await emit(bus, "binance_futures", "oi", {"oi": float(data.get("openInterest") or 0)})
-
-
-async def _poll_mtf(session: aiohttp.ClientSession, bus: asyncio.Queue) -> None:
-    for interval in ("1h", "4h"):
-        url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit=80"
+async def _poll_oi(session: aiohttp.ClientSession, bus: asyncio.Queue, coins: list[str]) -> None:
+    for asset, symbol in symbols_for("binance", coins):
+        url = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}"
         async with session.get(url) as resp:
             if resp.status != 200:
                 continue
-            rows = await resp.json()
-            closes = [float(row[4]) for row in rows]
-            volumes = [float(row[5]) for row in rows]
-            await emit(bus, "binance_spot", "mtf", {"interval": interval, "closes": closes, "volumes": volumes})
+            data = await resp.json()
+            await emit(bus, "binance_futures", "oi", {"oi": float(data.get("openInterest") or 0)}, asset=asset)
+
+
+async def _poll_mtf(session: aiohttp.ClientSession, bus: asyncio.Queue, coins: list[str]) -> None:
+    for asset, symbol in symbols_for("binance", coins):
+        for interval in ("1h", "4h"):
+            url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=80"
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    continue
+                rows = await resp.json()
+                closes = [float(row[4]) for row in rows]
+                volumes = [float(row[5]) for row in rows]
+                await emit(
+                    bus,
+                    "binance_spot",
+                    "mtf",
+                    {"interval": interval, "closes": closes, "volumes": volumes},
+                    asset=asset,
+                )
 
 
 SOURCE_RUNNERS = {

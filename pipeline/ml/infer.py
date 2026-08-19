@@ -14,6 +14,7 @@ from pipeline.ml.ensemble import active_artifacts, combine
 from pipeline.models import EnsembleConfig, FeatureBar, ModelArtifact, Prediction
 from pipeline.store import get_setting
 from pipeline.trading.markets import btc_15m_slug
+from pipeline.universe import normalize_assets
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,25 @@ def vectorize(features: dict[str, Any], columns: list[str]) -> np.ndarray:
 
 
 def predict_latest() -> dict[str, Any] | None:
-    bar = FeatureBar.objects.order_by("-ts").first()
+    cfg = EnsembleConfig.objects.order_by("id").first()
+    job = cfg.active_job if cfg else None
+    job_cfg = (job.config if job else None) or {}
+    interval = job_cfg.get("interval_seconds")
+    assets = job_cfg.get("assets")
+    qs = FeatureBar.objects.all()
+    if interval:
+        qs = qs.filter(interval_seconds=int(interval))
+    if assets:
+        normalized = normalize_assets(assets)
+        if len(normalized) == 1:
+            qs = qs.filter(asset=normalized[0])
+        else:
+            qs = qs.filter(asset="BTC")
+    else:
+        qs = qs.filter(asset="BTC")
+    bar = qs.order_by("-ts").first()
+    if bar is None:
+        bar = FeatureBar.objects.filter(asset="BTC").order_by("-ts").first() or FeatureBar.objects.order_by("-ts").first()
     if bar is None:
         return None
     artifacts = active_artifacts()

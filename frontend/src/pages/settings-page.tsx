@@ -15,6 +15,7 @@ import {
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
+import { AssetFields, TimeframeFields } from "@/components/universe-fields"
 
 export function SettingsPage() {
   const { boot, refresh } = useBoot()
@@ -23,7 +24,14 @@ export function SettingsPage() {
   const [minEdge, setMinEdge] = useState(String(s.min_edge ?? 0.04))
   const [minConf, setMinConf] = useState(String(s.min_confidence ?? 0.55))
   const [orderSize, setOrderSize] = useState(String(s.order_size ?? 10))
-  const [barSec, setBarSec] = useState(String(s.bar_interval_seconds ?? 5))
+  const universe = boot?.universe
+  const [coins, setCoins] = useState<string[]>(
+    (s.enabled_assets as string[] | undefined) ?? universe?.enabled_assets ?? universe?.default_assets ?? []
+  )
+  const [timeframes, setTimeframes] = useState<string[]>(
+    (s.bar_timeframes as string[] | undefined) ?? universe?.enabled_timeframes ?? universe?.default_timeframes ?? []
+  )
+  const [barSec, setBarSec] = useState(String(s.bar_interval_seconds ?? 0))
   const [maxOrders, setMaxOrders] = useState(String(s.max_orders_per_window ?? 1))
   const [pk, setPk] = useState("")
   const [funder, setFunder] = useState(String(s.polymarket_funder ?? ""))
@@ -40,6 +48,8 @@ export function SettingsPage() {
       min_confidence: Number(minConf),
       order_size: Number(orderSize),
       bar_interval_seconds: Number(barSec),
+      enabled_assets: coins,
+      bar_timeframes: timeframes,
       max_orders_per_window: Number(maxOrders),
       polymarket_funder: funder,
       polymarket_signature_type: Number(sigType),
@@ -94,11 +104,21 @@ export function SettingsPage() {
               <Input id="maxo" value={maxOrders} onChange={(e) => setMaxOrders(e.target.value)} />
             </Field>
             <Field>
-              <FieldLabel htmlFor="bar">Bar interval seconds</FieldLabel>
+              <FieldLabel htmlFor="bar">Optional micro snapshot seconds</FieldLabel>
               <Input id="bar" value={barSec} onChange={(e) => setBarSec(e.target.value)} />
-              <FieldDescription>Restart the collector after changing this.</FieldDescription>
+              <FieldDescription>0 = off. Restart the collector after changing coins or timeframes.</FieldDescription>
             </Field>
           </FieldGroup>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>Collection universe</CardTitle>
+          <CardDescription>Live streams subscribe to every selected coin and write every selected timeframe at once.</CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-4">
+          <AssetFields assets={universe?.assets ?? []} selected={coins} onChange={setCoins} />
+          <TimeframeFields timeframes={universe?.timeframes ?? []} selected={timeframes} onChange={setTimeframes} />
         </CardContent>
       </Card>
       <Card>

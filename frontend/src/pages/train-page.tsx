@@ -23,7 +23,8 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
-import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
+import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field"
+import { Switch } from "@/components/ui/switch"
 import {
   Table,
   TableBody,
@@ -43,6 +44,9 @@ export function TrainPage() {
   const [ensemble, setEnsemble] = useState<Ensemble | null>(null)
   const [mode, setMode] = useState("auc_weighted")
   const [busy, setBusy] = useState(false)
+  const [timeframe, setTimeframe] = useState("1m")
+  const [label, setLabel] = useState("next")
+  const [pool, setPool] = useState(true)
 
   useEffect(() => {
     if (arches.length && selected.length === 0) setSelected(arches.map((a) => a.id))
@@ -74,7 +78,15 @@ export function TrainPage() {
   async function train() {
     setBusy(true)
     try {
-      await postTrain({ architectures: selected, min_rows: 200, folds: 5 })
+      await postTrain({
+        architectures: selected,
+        min_rows: 200,
+        folds: 5,
+        timeframe,
+        label,
+        pool_assets: pool,
+        assets: pool ? boot?.settings.enabled_assets ?? boot?.universe?.enabled_assets : ["BTC"],
+      })
       toast.success("Training started in a background process")
       await refresh()
     } catch (err) {
@@ -99,7 +111,7 @@ export function TrainPage() {
         <div className="flex flex-col gap-1">
           <h1 className="text-lg font-medium">Train 20 architectures</h1>
           <p className="text-sm text-muted-foreground">
-            Walk-forward validation on labeled 15-minute direction. Pick models for the ensemble.
+            Walk-forward on pooled coins. Start with 1-minute next-bar labels so you can test a model in minutes, then switch to the 15-minute horizon.
           </p>
         </div>
         <Button onClick={train} disabled={busy || selected.length === 0}>
@@ -109,10 +121,46 @@ export function TrainPage() {
       <Alert>
         <AlertTitle>Need labeled bars</AlertTitle>
         <AlertDescription>
-          You currently have {boot?.counts.labeled ?? 0} labeled bars ({boot?.counts.bars ?? 0} total).
-          Backfill 1m klines or let the collector run past the 15-minute horizon.
+          You currently have {boot?.counts.labeled_next ?? 0} next-bar labels and {boot?.counts.labeled ?? 0} 15-minute labels
+          ({boot?.counts.bars ?? 0} total bars). Pooling BTC/ETH/XRP on 1m is the fastest way to reach 200 rows.
         </AlertDescription>
       </Alert>
+      <Card>
+        <CardHeader>
+          <CardTitle>Dataset</CardTitle>
+          <CardDescription>Same features for every coin; asset identity is not an input, so the model can generalize.</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <FieldGroup>
+            <Field>
+              <FieldLabel>Timeframe</FieldLabel>
+              <ToggleGroup value={[timeframe]} onValueChange={(v) => v[0] && setTimeframe(v[0])}>
+                {(boot?.universe?.timeframes ?? [{ id: "1m" }, { id: "5m" }, { id: "15m" }, { id: "1h" }]).map((tf) => (
+                  <ToggleGroupItem key={tf.id} value={tf.id}>
+                    {tf.id}
+                  </ToggleGroupItem>
+                ))}
+              </ToggleGroup>
+            </Field>
+            <Field>
+              <FieldLabel>Label</FieldLabel>
+              <ToggleGroup value={[label]} onValueChange={(v) => v[0] && setLabel(v[0])}>
+                <ToggleGroupItem value="next">Next bar</ToggleGroupItem>
+                <ToggleGroupItem value="horizon_15m">15m horizon</ToggleGroupItem>
+              </ToggleGroup>
+              <FieldDescription>
+                {label === "next"
+                  ? "1m bars become trainable after one minute. Best for a starter model."
+                  : "Matches Polymarket BTC Up/Down. Needs 15 minutes of future price."}
+              </FieldDescription>
+            </Field>
+            <Field orientation="horizontal">
+              <Switch id="pool" checked={pool} onCheckedChange={setPool} />
+              <FieldLabel htmlFor="pool">Pool all collected coins into one dataset</FieldLabel>
+            </Field>
+          </FieldGroup>
+        </CardContent>
+      </Card>
       <Card>
         <CardHeader>
           <CardTitle>Architectures</CardTitle>

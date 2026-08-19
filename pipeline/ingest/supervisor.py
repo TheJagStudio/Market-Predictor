@@ -8,12 +8,11 @@ from typing import Any
 
 import aiohttp
 from asgiref.sync import sync_to_async
-from django.conf import settings
 from django.utils import timezone as dj_tz
 
 from pipeline.catalog import FREE_SOURCES
 from pipeline.ingest.engine import MarketState
-from pipeline.ingest.sources import SOURCE_RUNNERS, emit, polymarket_clob
+from pipeline.ingest.sources import SOURCE_RUNNERS, polymarket_clob
 from pipeline.models import (
     AppLog,
     CollectorSource,
@@ -25,34 +24,71 @@ from pipeline.models import (
 from pipeline.procutil import write_pid
 from pipeline.store import get_setting
 from pipeline.trading.markets import book_top, current_window_start, fetch_book, fetch_market
+from pipeline.universe import (
+    TIMEFRAMES,
+    asset_from_poly_slug,
+    bar_intervals_seconds,
+    configured_assets,
+    configured_kline_intervals,
+    poly_slug,
+    set_runtime,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class CollectorRuntime:
     def __init__(self) -> None:
-        self.state = MarketState()
+        self.states: dict[str, MarketState] = {}
         self.bus: asyncio.Queue = asyncio.Queue(maxsize=50_000)
         self.tick_buffer: list[LiveTick] = []
         self.stop = asyncio.Event()
         self.messages = 0
         self.bars_written = 0
         self.token_ids: list[str] = []
+        self.token_to_asset: dict[str, str] = {}
         self.current_slug = ""
+        self.assets: list[str] = ["BTC"]
+        self.intervals: list[int] = [60]
+        self.vpin_bucket = 50_000.0
+        self.vpin_window = 50
+        self.tfi_windows: list[int] = [15, 60, 180, 300]
+
+    def state_for(self, asset: str) -> MarketState:
+        key = (asset or "BTC").upper()
+        if key == "*":
+            key = "BTC"
+        if key not in self.states:
+            state = MarketState()
+            state.vpin_bucket = self.vpin_bucket
+            state.vpin_window = self.vpin_window
+            state.tfi_windows = list(self.tfi_windows)
+            self.states[key] = state
+        return self.states[key]
+
+    def _load_config(self) -> set[str]:
+        self.assets = configured_assets()
+        klines = configured_kline_intervals()
+        set_runtime(self.assets, klines)
+        self.intervals = bar_intervals_seconds()
+        usd_bucket = get_setting("vpin_bucket_usd")
+        btc_bucket = float(get_setting("vpin_bucket_btc") or 25.0)
+        self.vpin_bucket = float(usd_bucket) if usd_bucket else btc_bucket * 100_000.0
+        self.vpin_window = int(get_setting("vpin_window_buckets") or 50)
+        windows = get_setting("tfi_windows_seconds") or [15, 60, 180, 300]
+        self.tfi_windows = [int(w) for w in windows]
+        for asset in self.assets:
+            self.state_for(asset)
+        return set(get_setting("enabled_sources") or [])
 
     async def run(self) -> None:
         write_pid("collector", os.getpid())
-        interval = int(get_setting("bar_interval_seconds") or settings.DEFAULT_BAR_SECONDS)
-        self.state.vpin_bucket = float(get_setting("vpin_bucket_btc") or 25.0)
-        self.state.vpin_window = int(get_setting("vpin_window_buckets") or 50)
-        windows = get_setting("tfi_windows_seconds") or [15, 60, 180, 300]
-        self.state.tfi_windows = [int(w) for w in windows]
-        enabled = set(get_setting("enabled_sources") or [])
+        enabled = await sync_to_async(self._load_config)()
         await _ensure_sources(enabled)
 
         tasks = [
             asyncio.create_task(self.consume(), name="consume"),
-            asyncio.create_task(self.emit_bars(interval), name="bars"),
+            asyncio.create_task(self.emit_bars(), name="bars"),
             asyncio.create_task(self.flush_loop(), name="flush"),
             asyncio.create_task(self.heartbeat_loop(), name="hb"),
             asyncio.create_task(self.poly_loop(), name="poly"),
@@ -72,9 +108,13 @@ class CollectorRuntime:
             runner = SOURCE_RUNNERS.get(sid)
             if not runner:
                 continue
-            tasks.append(asyncio.create_task(self._run_named(sid, lambda r=runner: r(self.bus))))
+            tasks.append(asyncio.create_task(self._run_named(sid, lambda r=runner: r(self.bus, self.assets))))
 
-        await _log("info", "collector", f"collector started pid={os.getpid()} sources={sorted(enabled)}")
+        await _log(
+            "info",
+            "collector",
+            f"collector started pid={os.getpid()} assets={self.assets} intervals={self.intervals} sources={sorted(enabled)}",
+        )
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -104,17 +144,26 @@ class CollectorRuntime:
             kind = event["kind"]
             ts = float(event["ts"])
             data = event["data"]
-            self.state.message_counts[venue] += 1
-            self.state.last_event_ts[venue] = ts
-            try:
-                self._apply(venue, kind, ts, data)
-            except Exception as exc:
-                logger.debug("apply failed %s %s: %s", venue, kind, exc)
+            asset = str(event.get("asset") or data.get("asset") or "BTC").upper()
+            if kind == "fng":
+                for state in self.states.values():
+                    state.fear_greed = float(data.get("value") or 0)
+                    state.message_counts[venue] += 1
+                    state.last_event_ts[venue] = ts
+            else:
+                state = self.state_for("BTC" if asset == "*" else asset)
+                state.message_counts[venue] += 1
+                state.last_event_ts[venue] = ts
+                try:
+                    self._apply(state, venue, kind, ts, data, asset)
+                except Exception as exc:
+                    logger.debug("apply failed %s %s %s: %s", asset, venue, kind, exc)
             if kind == "trade":
                 self.tick_buffer.append(
                     LiveTick(
                         ts_ms=int(ts * 1000),
                         venue=venue,
+                        asset="BTC" if asset == "*" else asset,
                         kind="trade",
                         price=float(data.get("price") or 0),
                         size=float(data.get("size") or 0),
@@ -122,105 +171,138 @@ class CollectorRuntime:
                         extra={},
                     )
                 )
+            if kind == "kline":
+                await self._maybe_write_kline_bar(asset, data, ts)
             source_name = _source_for_venue(venue)
             if self.messages % 200 == 0:
                 await _set_source(source_name, status="live", bump=200, error="")
 
-    def _apply(self, venue: str, kind: str, ts: float, data: dict[str, Any]) -> None:
+    def _apply(self, state: MarketState, venue: str, kind: str, ts: float, data: dict[str, Any], asset: str) -> None:
         if kind == "trade":
-            self.state.on_trade(venue, float(data["price"]), float(data["size"]), bool(data.get("is_buyer_maker")), ts)
+            state.on_trade(venue, float(data["price"]), float(data["size"]), bool(data.get("is_buyer_maker")), ts)
         elif kind == "book":
-            book = self.state.book(venue)
+            book = state.book(venue)
             bids = data.get("bids") or []
             asks = data.get("asks") or []
             if data.get("snapshot", True) or (bids and asks):
                 book.apply_snapshot(bids, asks)
-            last = self.state.last_price.get(venue) or book.mid()
+            last = state.last_price.get(venue) or book.mid()
             if last:
-                self.state.last_price[venue] = last
+                state.last_price[venue] = last
         elif kind == "book_delta":
-            book = self.state.book(venue)
+            book = state.book(venue)
             for change in data.get("changes") or []:
                 if len(change) >= 3:
                     book.apply_delta(str(change[0]), float(change[1]), float(change[2]))
         elif kind == "ticker":
             price = data.get("price")
             if price:
-                self.state.last_price[venue] = float(price)
+                state.last_price[venue] = float(price)
             bid, ask = data.get("bid"), data.get("ask")
             if bid and ask:
-                book = self.state.book(venue)
+                book = state.book(venue)
                 book.apply_snapshot([[bid, data.get("bid_sz") or 1]], [[ask, data.get("ask_sz") or 1]])
             if data.get("funding") is not None:
                 key = "bybit" if venue == "bybit" else venue
-                self.state.funding[key] = float(data["funding"])
+                state.funding[key] = float(data["funding"])
             if data.get("oi"):
-                self.state.open_interest = float(data["oi"])
+                state.open_interest = float(data["oi"])
         elif kind == "mark":
             if data.get("funding") is not None:
-                self.state.funding["binance"] = float(data["funding"])
+                state.funding["binance"] = float(data["funding"])
             if data.get("mark"):
-                self.state.last_price["binance_futures"] = float(data["mark"])
+                state.last_price["binance_futures"] = float(data["mark"])
         elif kind == "liq":
-            self.state.on_liq(float(data.get("notional") or 0), ts)
+            state.on_liq(float(data.get("notional") or 0), ts)
         elif kind == "funding":
-            self.state.funding["okx"] = float(data.get("funding") or 0)
+            state.funding["okx"] = float(data.get("funding") or 0)
         elif kind == "oi":
-            self.state.open_interest = float(data.get("oi") or 0)
-        elif kind == "fng":
-            self.state.fear_greed = float(data.get("value") or 0)
+            state.open_interest = float(data.get("oi") or 0)
         elif kind == "mempool":
-            self.state.mempool_fast = float(data.get("fastestFee") or 0)
+            state.mempool_fast = float(data.get("fastestFee") or 0)
         elif kind == "kline":
-            _push_kline(self.state, data)
+            _push_kline(state, data)
         elif kind == "mtf":
             interval = data.get("interval")
             closes = [float(x) for x in data.get("closes") or []]
             if interval == "1h":
-                self.state.klines_1h.clear()
-                self.state.klines_1h.extend(closes)
+                state.klines_1h.clear()
+                state.klines_1h.extend(closes)
             elif interval == "4h":
-                self.state.klines_4h.clear()
-                self.state.klines_4h.extend(closes)
+                state.klines_4h.clear()
+                state.klines_4h.extend(closes)
         elif kind == "clob":
             self._apply_clob(data.get("payload") or {})
 
     def _apply_clob(self, payload: dict[str, Any]) -> None:
         event = payload.get("event_type") or payload.get("type")
-        asset = str(payload.get("asset_id") or payload.get("asset") or "")
-        token_up = str(self.state.poly.get("token_up") or "")
-        is_yes = asset == token_up if token_up else True
+        token = str(payload.get("asset_id") or payload.get("asset") or "")
+        asset = self.token_to_asset.get(token, "BTC")
+        state = self.state_for(asset)
+        token_up = str(state.poly.get("token_up") or "")
+        is_yes = token == token_up if token_up else True
         if event == "book" or payload.get("bids") or payload.get("asks"):
             bids = payload.get("bids") or []
             asks = payload.get("asks") or []
             bid, ask, obi = book_top({"bids": bids, "asks": asks})
             prefix = "yes" if is_yes else "no"
             if bid is not None:
-                self.state.poly[f"{prefix}_bid"] = bid
+                state.poly[f"{prefix}_bid"] = bid
             if ask is not None:
-                self.state.poly[f"{prefix}_ask"] = ask
+                state.poly[f"{prefix}_ask"] = ask
             if obi is not None:
-                self.state.poly[f"{prefix}_obi"] = obi
+                state.poly[f"{prefix}_obi"] = obi
         if event == "best_bid_ask":
             prefix = "yes" if is_yes else "no"
             if payload.get("best_bid"):
-                self.state.poly[f"{prefix}_bid"] = float(payload["best_bid"])
+                state.poly[f"{prefix}_bid"] = float(payload["best_bid"])
             if payload.get("best_ask"):
-                self.state.poly[f"{prefix}_ask"] = float(payload["best_ask"])
+                state.poly[f"{prefix}_ask"] = float(payload["best_ask"])
         if event == "last_trade_price" and payload.get("price"):
             if is_yes:
-                self.state.poly["last_trade_yes"] = float(payload["price"])
+                state.poly["last_trade_yes"] = float(payload["price"])
 
-    async def emit_bars(self, interval: int) -> None:
+    async def _maybe_write_kline_bar(self, asset: str, data: dict[str, Any], now: float) -> None:
+        interval_name = str(data.get("interval") or "")
+        interval_sec = TIMEFRAMES.get(interval_name)
+        if not interval_sec or interval_sec not in self.intervals:
+            return
+        open_time = data.get("open_time")
+        if not open_time:
+            return
+        ts = int(open_time) // 1000 if int(open_time) > 10_000_000_000 else int(open_time)
+        state = self.state_for(asset)
+        feats = state.snapshot(now)
+        mid = feats.get("mid") or data.get("close")
+        if mid is None:
+            return
+        await _upsert_bar(asset, ts, interval_sec, float(mid), feats)
+        self.bars_written += 1
+
+    async def emit_bars(self) -> None:
+        last_ts: dict[tuple[str, int], int] = {}
         while True:
-            await asyncio.sleep(interval)
+            await asyncio.sleep(1)
             now = time.time()
-            ts = int(now) - (int(now) % interval)
-            feats = self.state.snapshot(now)
-            mid = feats.get("mid")
-            await _upsert_bar(ts, interval, mid, feats)
-            self.bars_written += 1
-            self.state.reset_second_counters()
+            intervals = self.intervals or [60]
+            for asset, state in list(self.states.items()):
+                feats = None
+                wrote = False
+                for interval in intervals:
+                    ts = int(now) - (int(now) % interval)
+                    if last_ts.get((asset, interval)) == ts:
+                        continue
+                    last_ts[(asset, interval)] = ts
+                    if feats is None:
+                        feats = state.snapshot(now)
+                    mid = feats.get("mid")
+                    if mid is None:
+                        continue
+                    await _upsert_bar(asset, ts, interval, mid, feats)
+                    self.bars_written += 1
+                    wrote = True
+                if wrote:
+                    state.reset_second_counters()
 
     async def flush_loop(self) -> None:
         while True:
@@ -238,15 +320,22 @@ class CollectorRuntime:
 
     async def heartbeat_loop(self) -> None:
         while True:
+            mids = {asset: state.reference_mid() for asset, state in self.states.items()}
             await _heartbeat(
                 "collector",
                 {
                     "messages": self.messages,
                     "bars": self.bars_written,
                     "queue": self.bus.qsize(),
-                    "mid": self.state.reference_mid(),
+                    "mid": mids.get("BTC") or next((v for v in mids.values() if v), None),
+                    "mids": mids,
+                    "assets": list(self.states),
+                    "intervals": self.intervals,
                     "slug": self.current_slug,
-                    "venues": dict(self.state.message_counts),
+                    "venues": {
+                        venue: sum(state.message_counts.get(venue, 0) for state in self.states.values())
+                        for venue in {v for state in self.states.values() for v in state.message_counts}
+                    },
                 },
             )
             await asyncio.sleep(2)
@@ -257,11 +346,22 @@ class CollectorRuntime:
             while True:
                 try:
                     start = current_window_start()
-                    market = await fetch_market(session, start)
-                    if market:
-                        self.current_slug = market["slug"]
-                        self.token_ids = [t for t in (market.get("token_up"), market.get("token_down")) if t]
-                        self.state.poly.update(
+                    all_tokens: list[str] = []
+                    for asset in self.assets:
+                        slug = poly_slug(asset, start)
+                        if not slug:
+                            continue
+                        market = await fetch_market(session, start, asset=asset)
+                        if not market:
+                            continue
+                        state = self.state_for(asset)
+                        if asset == "BTC":
+                            self.current_slug = market["slug"]
+                        for token in (market.get("token_up"), market.get("token_down")):
+                            if token:
+                                all_tokens.append(str(token))
+                                self.token_to_asset[str(token)] = asset
+                        state.poly.update(
                             {
                                 "slug": market["slug"],
                                 "token_up": market.get("token_up"),
@@ -271,24 +371,26 @@ class CollectorRuntime:
                                 "seconds_left": max(0, market["end_ts"] - time.time()),
                             }
                         )
-                        if self.state.poly.get("btc_open") is None:
-                            self.state.poly["btc_open"] = self.state.reference_mid()
-                        mid = self.state.reference_mid()
+                        if state.poly.get("btc_open") is None:
+                            state.poly["btc_open"] = state.reference_mid()
+                        mid = state.reference_mid()
                         if mid:
-                            self.state.poly["btc_last"] = mid
+                            state.poly["btc_last"] = mid
                         if market.get("token_up"):
                             up_book = await fetch_book(session, market["token_up"])
                             bid, ask, obi = book_top(up_book)
-                            self.state.poly["yes_bid"] = bid
-                            self.state.poly["yes_ask"] = ask
-                            self.state.poly["yes_obi"] = obi
+                            state.poly["yes_bid"] = bid
+                            state.poly["yes_ask"] = ask
+                            state.poly["yes_obi"] = obi
                         if market.get("token_down"):
                             down_book = await fetch_book(session, market["token_down"])
                             bid, ask, obi = book_top(down_book)
-                            self.state.poly["no_bid"] = bid
-                            self.state.poly["no_ask"] = ask
-                            self.state.poly["no_obi"] = obi
-                        await _upsert_poly(market, self.state.poly)
+                            state.poly["no_bid"] = bid
+                            state.poly["no_ask"] = ask
+                            state.poly["no_obi"] = obi
+                        await _upsert_poly(market, state.poly)
+                    self.token_ids = all_tokens
+                    if all_tokens:
                         await _set_source("polymarket_gamma", status="live", bump=1, error="")
                         await _set_source("polymarket_clob", status="live", error="")
                 except asyncio.CancelledError:
@@ -335,6 +437,7 @@ def _push_kline(state: MarketState, data: dict[str, Any]) -> None:
         buf.append(close)
     if interval == "1m":
         state.volumes_1m.append(volume)
+    state.last_price["binance_spot"] = close
 
 
 def _source_for_venue(venue: str) -> str:
@@ -347,36 +450,96 @@ def _source_for_venue(venue: str) -> str:
     return venue
 
 
-def label_ready_bars(horizon: int = 900, limit: int = 4000) -> int:
+def label_ready_bars(horizon: int = 900, limit: int = 8000) -> int:
     now = int(time.time())
+    labeled_15 = _label_horizon(now, horizon, limit)
+    labeled_next = _label_next(now, limit)
+    _label_poly_windows()
+    return labeled_15 + labeled_next
+
+
+def _future_maps(bars: list[FeatureBar]) -> tuple[dict[tuple[str, int, int], float], dict[tuple[str, int], float]]:
+    if not bars:
+        return {}, {}
+    assets = {bar.asset for bar in bars}
+    min_ts = min(bar.ts for bar in bars)
+    max_interval = max(bar.interval_seconds for bar in bars)
+    max_ts = max(bar.ts for bar in bars) + 900 + max_interval * 2
+    same: dict[tuple[str, int, int], float] = {}
+    any_tf: dict[tuple[str, int], float] = {}
+    for row in FeatureBar.objects.filter(asset__in=assets, ts__gte=min_ts, ts__lte=max_ts).only(
+        "asset", "ts", "interval_seconds", "mid_price"
+    ):
+        if row.mid_price is None:
+            continue
+        same[(row.asset, row.interval_seconds, row.ts)] = row.mid_price
+        key = (row.asset, row.ts)
+        if key not in any_tf:
+            any_tf[key] = row.mid_price
+    return same, any_tf
+
+
+def _lookup_future(
+    asset: str,
+    interval: int,
+    target: int,
+    current_ts: int,
+    same: dict[tuple[str, int, int], float],
+    any_tf: dict[tuple[str, int], float],
+) -> float | None:
+    candidates = [target]
+    for delta in range(1, interval + 3):
+        candidates.append(target + delta)
+        back = target - delta
+        if back > current_ts:
+            candidates.append(back)
+    for ts in candidates:
+        price = same.get((asset, interval, ts)) or any_tf.get((asset, ts))
+        if price is not None:
+            return price
+    return None
+
+
+def _label_horizon(now: int, horizon: int, limit: int) -> int:
     qs = list(
         FeatureBar.objects.filter(label_up_15m__isnull=True, ts__lte=now - horizon).order_by("ts")[:limit]
     )
     if not qs:
         return 0
-    interval = qs[0].interval_seconds
-    min_ts = qs[0].ts
-    max_ts = qs[-1].ts + horizon + interval * 2
-    futures = {
-        row.ts: row.mid_price
-        for row in FeatureBar.objects.filter(interval_seconds=interval, ts__gte=min_ts, ts__lte=max_ts)
-    }
+    same, any_tf = _future_maps(qs)
     updated = []
     for bar in qs:
-        target = bar.ts + horizon
-        future_px = futures.get(target)
+        if bar.mid_price is None:
+            continue
+        future_px = _lookup_future(bar.asset, bar.interval_seconds, bar.ts + horizon, bar.ts, same, any_tf)
         if future_px is None:
-            for delta in range(1, interval + 3):
-                future_px = futures.get(target + delta) or futures.get(target - delta)
-                if future_px is not None:
-                    break
-        if future_px is None or bar.mid_price is None:
             continue
         bar.label_up_15m = bool(future_px > bar.mid_price)
         updated.append(bar)
     if updated:
         FeatureBar.objects.bulk_update(updated, ["label_up_15m"], batch_size=500)
-    _label_poly_windows()
+    return len(updated)
+
+
+def _label_next(now: int, limit: int) -> int:
+    qs = list(FeatureBar.objects.filter(label_up_next__isnull=True).order_by("ts")[: limit * 2])
+    ready = [bar for bar in qs if bar.ts + bar.interval_seconds <= now]
+    if not ready:
+        return 0
+    same, any_tf = _future_maps(ready)
+    updated = []
+    for bar in ready:
+        if bar.mid_price is None:
+            continue
+        future_px = _lookup_future(
+            bar.asset, bar.interval_seconds, bar.ts + bar.interval_seconds, bar.ts, same, any_tf
+        )
+        if future_px is None:
+            continue
+        bar.label_up_next = bool(future_px > bar.mid_price)
+        updated.append(bar)
+    if updated:
+        FeatureBar.objects.bulk_update(updated, ["label_up_next"], batch_size=500)
     return len(updated)
 
 
@@ -386,14 +549,19 @@ def _label_poly_windows() -> None:
         if window.btc_open and window.btc_last:
             window.resolved_up = window.btc_last > window.btc_open
             window.save(update_fields=["resolved_up"])
-            FeatureBar.objects.filter(ts__gte=window.start_ts, ts__lt=window.end_ts, label_poly_up__isnull=True).update(
-                label_poly_up=window.resolved_up
-            )
+            asset = asset_from_poly_slug(window.slug) or "BTC"
+            FeatureBar.objects.filter(
+                asset=asset,
+                ts__gte=window.start_ts,
+                ts__lt=window.end_ts,
+                label_poly_up__isnull=True,
+            ).update(label_poly_up=window.resolved_up)
 
 
 @sync_to_async
-def _upsert_bar(ts: int, interval: int, mid: float | None, feats: dict[str, Any]) -> None:
+def _upsert_bar(asset: str, ts: int, interval: int, mid: float | None, feats: dict[str, Any]) -> None:
     FeatureBar.objects.update_or_create(
+        asset=asset,
         ts=ts,
         interval_seconds=interval,
         defaults={"mid_price": mid, "features": feats},

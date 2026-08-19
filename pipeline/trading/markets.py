@@ -23,6 +23,13 @@ def btc_15m_slug(start: int | None = None) -> str:
     return f"btc-updown-15m-{start if start is not None else current_window_start()}"
 
 
+def updown_slug(asset: str = "BTC", start: int | None = None) -> str:
+    from pipeline.universe import poly_slug
+
+    ts = start if start is not None else current_window_start()
+    return poly_slug(asset, ts) or f"{asset.lower()}-updown-15m-{ts}"
+
+
 def _parse_json_field(value: Any) -> Any:
     if isinstance(value, str):
         try:
@@ -46,8 +53,8 @@ async def fetch_json(session: aiohttp.ClientSession, url: str) -> Any | None:
         return None
 
 
-async def fetch_market(session: aiohttp.ClientSession, start: int | None = None) -> dict[str, Any] | None:
-    slug = btc_15m_slug(start)
+async def fetch_market(session: aiohttp.ClientSession, start: int | None = None, asset: str = "BTC") -> dict[str, Any] | None:
+    slug = updown_slug(asset, start)
     event = await fetch_json(session, f"{GAMMA}/events/slug/{slug}")
     market = await fetch_json(session, f"{GAMMA}/markets/slug/{slug}")
     if not market:

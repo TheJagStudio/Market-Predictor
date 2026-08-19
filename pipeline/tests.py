@@ -17,6 +17,13 @@ class FeatureMathTests(TestCase):
         self.assertAlmostEqual(meter.current_imbalance, 1.0)
         meter.process_tick(0.0, is_buyer_maker=False, now=11.5)
         self.assertAlmostEqual(meter.current_imbalance, 0.0)
+        self.assertIsNone(meter.ratio)
+
+    def test_tfi_ratio_is_scale_free(self) -> None:
+        meter = RealTimeTradeImbalance(window_seconds=10)
+        meter.process_tick(100.0, is_buyer_maker=False, now=0.0)
+        meter.process_tick(50.0, is_buyer_maker=True, now=1.0)
+        self.assertAlmostEqual(meter.ratio or 0.0, 50.0 / 150.0)
 
     def test_vpin_splits_oversized_tick(self) -> None:
         vpin = RealTimeVPIN(bucket_volume=10.0, window_size=2)
@@ -71,6 +78,40 @@ class LabelAndVectorTests(TestCase):
         bar = FeatureBar.objects.get(ts=1_000)
         self.assertTrue(bar.label_up_15m)
 
+    def test_labels_do_not_mix_assets(self) -> None:
+        FeatureBar.objects.create(asset="BTC", ts=1_000, interval_seconds=60, mid_price=100.0, features={})
+        FeatureBar.objects.create(asset="BTC", ts=1_900, interval_seconds=60, mid_price=90.0, features={})
+        FeatureBar.objects.create(asset="ETH", ts=1_000, interval_seconds=60, mid_price=100.0, features={})
+        FeatureBar.objects.create(asset="ETH", ts=1_900, interval_seconds=60, mid_price=130.0, features={})
+        from pipeline.ingest.supervisor import label_ready_bars
+
+        label_ready_bars(horizon=900, limit=20)
+        btc = FeatureBar.objects.get(asset="BTC", ts=1_000)
+        eth = FeatureBar.objects.get(asset="ETH", ts=1_000)
+        self.assertFalse(btc.label_up_15m)
+        self.assertTrue(eth.label_up_15m)
+
+    def test_next_bar_label(self) -> None:
+        FeatureBar.objects.create(asset="XRP", ts=1_000, interval_seconds=60, mid_price=1.0, features={})
+        FeatureBar.objects.create(asset="XRP", ts=1_060, interval_seconds=60, mid_price=1.2, features={})
+        from pipeline.ingest.supervisor import label_ready_bars
+
+        labeled = label_ready_bars(horizon=900, limit=20)
+        self.assertGreaterEqual(labeled, 1)
+        first = FeatureBar.objects.get(asset="XRP", ts=1_000)
+        self.assertTrue(first.label_up_next)
+        self.assertIsNone(first.label_up_15m)
+
+
+class UniverseTests(TestCase):
+    def test_symbol_maps(self) -> None:
+        from pipeline.universe import asset_from_binance, normalize_assets, poly_slug
+
+        self.assertEqual(normalize_assets(["eth", "BTC", "ETH", "zzz"]), ["ETH", "BTC"])
+        self.assertEqual(asset_from_binance("ethusdt@trade"), "ETH")
+        self.assertEqual(poly_slug("ETH", 900), "eth-updown-15m-900")
+
+
 
 class MarketSlugTests(TestCase):
     def test_slug_aligns_to_900s(self) -> None:
@@ -90,6 +131,26 @@ class ApiTests(TestCase):
         body = boot.json()
         self.assertIn("sources", body)
         self.assertGreaterEqual(len(body["architectures"]), 10)
+        self.assertIn("universe", body)
+        self.assertGreaterEqual(len(body["universe"]["assets"]), 6)
+        self.assertGreaterEqual(len(body["universe"]["timeframes"]), 3)
+
+    def test_setup_saves_assets_and_timeframes(self) -> None:
+        client = APIClient()
+        resp = client.post(
+            "/api/setup",
+            {
+                "dry_run": True,
+                "enabled_assets": ["BTC", "ETH", "XRP"],
+                "bar_timeframes": ["1m", "5m"],
+                "enabled_sources": ["binance_spot"],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        settings = resp.json()["settings"]
+        self.assertEqual(settings["enabled_assets"], ["BTC", "ETH", "XRP"])
+        self.assertEqual(settings["bar_timeframes"], ["1m", "5m"])
 
     def test_setup_saves_non_secret_settings(self) -> None:
         client = APIClient()
@@ -125,10 +186,18 @@ class TrainJobTests(TestCase):
                     "binance_spot_obi5": x - 0.5,
                 },
                 label_up_15m=x > 0.5,
+                label_up_next=x > 0.4,
             )
         job = TrainingJob.objects.create(
             status="pending",
-            config={"architectures": ["logistic_regression", "random_forest"], "min_rows": 200, "folds": 2},
+            config={
+                "architectures": ["logistic_regression", "random_forest"],
+                "min_rows": 200,
+                "folds": 2,
+                "interval_seconds": 60,
+                "label": "next",
+                "assets": ["BTC", "ETH"],
+            },
         )
         from pipeline.ml.train import run_training_job
 

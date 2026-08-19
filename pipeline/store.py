@@ -14,9 +14,12 @@ SECRET_KEYS = {
 
 DEFAULTS: dict[str, Any] = {
     "setup_complete": False,
-    "bar_interval_seconds": 5,
+    "bar_interval_seconds": 0,
+    "bar_timeframes": ["1m", "5m", "15m"],
+    "enabled_assets": ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"],
     "tick_retention_hours": 6,
     "vpin_bucket_btc": 25.0,
+    "vpin_bucket_usd": 50_000.0,
     "vpin_window_buckets": 50,
     "tfi_windows_seconds": [15, 60, 180, 300],
     "horizon_seconds": 900,
@@ -103,6 +106,8 @@ def all_settings_public() -> dict[str, Any]:
 
 
 def apply_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    from pipeline.universe import normalize_assets, normalize_timeframes
+
     allowed = set(DEFAULTS) | SECRET_KEYS
     for key, value in payload.items():
         if key not in allowed:
@@ -111,5 +116,9 @@ def apply_settings(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         if key in SECRET_KEYS and value in (True, False, None, ""):
             continue
+        if key == "enabled_assets":
+            value = normalize_assets(value)
+        if key == "bar_timeframes":
+            value = normalize_timeframes(value)
         set_setting(key, value)
     return all_settings_public()

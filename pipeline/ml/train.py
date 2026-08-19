@@ -49,7 +49,16 @@ def train(job: TrainingJob) -> dict[str, Any]:
     min_rows = int(cfg.get("min_rows") or 200)
     folds = int(cfg.get("folds") or 5)
     interval = cfg.get("interval_seconds")
-    X, y, columns, timestamps = load_dataset(min_rows=min_rows, interval=interval)
+    assets = cfg.get("assets")
+    label = cfg.get("label")
+    label_field = cfg.get("label_field")
+    X, y, columns, timestamps = load_dataset(
+        min_rows=min_rows,
+        interval=interval,
+        assets=assets,
+        label=label,
+        label_field=label_field,
+    )
     splits = time_splits(len(y), folds=folds)
     factories = build_estimators()
     artifacts_dir: Path = Path(settings.ARTIFACTS_DIR) / f"job-{job.id}"
@@ -98,6 +107,9 @@ def train(job: TrainingJob) -> dict[str, Any]:
         "rows": int(len(y)),
         "features": columns,
         "n_features": len(columns),
+        "label_field": cfg.get("label_field") or ("label_up_next" if cfg.get("label") == "next" else "label_up_15m"),
+        "interval_seconds": interval,
+        "assets": assets,
         "span": {"start": timestamps[0], "end": timestamps[-1]} if timestamps else {},
         "models": results,
         "best": ranked[0] if ranked else None,

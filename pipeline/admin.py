@@ -33,4 +33,4 @@ admin.site.register(AppLog)
 
 @admin.register(FeatureBar)
 class FeatureBarAdmin(admin.ModelAdmin):
-    list_display = ("ts", "interval_seconds", "mid_price", "label_up_15m")
+    list_display = ("asset", "ts", "interval_seconds", "mid_price", "label_up_next", "label_up_15m")

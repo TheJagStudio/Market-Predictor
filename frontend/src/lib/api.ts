@@ -30,10 +30,18 @@ export const stopCollector = () => api("/collector/stop", { method: "POST", body
 export const startInference = () => api("/inference/start", { method: "POST", body: "{}" })
 export const stopInference = () => api("/inference/stop", { method: "POST", body: "{}" })
 export const getLive = () => api<LivePayload>("/live")
-export const postBackfill = (days: number, interval: string) =>
-  api<{ ok: boolean; fetched: number; created: number; updated: number }>("/backfill", {
+export const postBackfill = (days: number, body?: { interval?: string; intervals?: string[]; assets?: string[] }) =>
+  api<{
+    ok: boolean
+    fetched: number
+    created: number
+    updated: number
+    assets?: string[]
+    intervals?: string[]
+    per?: Array<Record<string, unknown>>
+  }>("/backfill", {
     method: "POST",
-    body: JSON.stringify({ days, interval }),
+    body: JSON.stringify({ days, ...body }),
   })
 export const getJobs = () => api<{ jobs: TrainJob[] }>("/train")
 export const postTrain = (body: Record<string, unknown>) =>
@@ -57,9 +65,31 @@ export type Settings = Record<string, unknown> & {
   min_confidence?: number
   order_size?: number
   enabled_sources?: string[]
+  enabled_assets?: string[]
+  bar_timeframes?: string[]
   bar_interval_seconds?: number
   polymarket_private_key_set?: boolean
   ensemble_mode?: string
+}
+
+export type UniverseAsset = { id: string; label: string }
+export type UniverseTimeframe = { id: string; label: string; seconds: number; kline?: boolean }
+export type LabelMode = { id: string; label: string; field: string; detail: string }
+export type Universe = {
+  assets: UniverseAsset[]
+  timeframes: UniverseTimeframe[]
+  label_modes: LabelMode[]
+  default_assets: string[]
+  default_timeframes: string[]
+  enabled_assets: string[]
+  enabled_timeframes: string[]
+}
+export type BarBreakdown = {
+  asset: string
+  interval_seconds: number
+  bars: number
+  labeled_15m: number
+  labeled_next: number
 }
 
 export type Source = {
@@ -100,9 +130,11 @@ export type Market = {
 
 export type Bar = {
   ts: number
+  asset?: string
   interval_seconds: number
   mid_price: number | null
   label_up_15m: boolean | null
+  label_up_next?: boolean | null
   features: Record<string, number | null>
   train_features: Record<string, number>
   n_features: number
@@ -169,9 +201,10 @@ export type Bootstrap = {
   settings: Settings
   sources: Source[]
   architectures: Architecture[]
+  universe?: Universe
   collector: ProcessInfo
   inference: ProcessInfo
-  counts: Record<string, number>
+  counts: Record<string, number> & { by_asset_interval?: BarBreakdown[] }
   latest_bar: Bar | null
   market: Market
   latest_prediction: Prediction | null
@@ -183,6 +216,7 @@ export type LivePayload = {
   ticks: Array<{
     ts_ms: number
     venue: string
+    asset?: string
     price: number | null
     size: number | null
     is_buyer_maker: boolean | null

@@ -58,7 +58,7 @@ class MarketState:
     message_counts: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     last_event_ts: dict[str, float] = field(default_factory=dict)
     mid_history: deque[tuple[float, float]] = field(default_factory=lambda: deque(maxlen=4000))
-    vpin_bucket: float = 25.0
+    vpin_bucket: float = 50_000.0
     vpin_window: int = 50
     tfi_windows: list[int] = field(default_factory=lambda: [15, 60, 180, 300])
 
@@ -88,9 +88,10 @@ class MarketState:
         self.vwap_num[venue] += price * size
         self.vwap_den[venue] += size
         self.intensity[venue].append(ts)
-        for window, meter in self.tfi[venue].items():
-            meter.process_tick(size, is_buyer_maker, ts)
-        self.vpin[venue].process_tick(size, is_buyer_maker)
+        notional = abs(size * price) if price else abs(size)
+        for _window, meter in self.tfi[venue].items():
+            meter.process_tick(notional, is_buyer_maker, ts)
+        self.vpin[venue].process_tick(notional, is_buyer_maker)
         _ = signed
 
     def on_liq(self, notional: float, ts: float) -> None:
@@ -158,8 +159,7 @@ class MarketState:
             feats[f"{venue}_depth_bid_50bps"] = book.depth_notional("bid", 0.005, book_mid) if book else None
             feats[f"{venue}_depth_ask_50bps"] = book.depth_notional("ask", 0.005, book_mid) if book else None
             for window, meter in self.tfi[venue].items():
-                den = last or 1.0
-                feats[f"{venue}_tfi_{window}"] = meter.current_imbalance / den if den else meter.current_imbalance
+                feats[f"{venue}_tfi_{window}"] = meter.ratio
             vpin_val = None
             buckets = self.vpin[venue].bucket_imbalances
             if len(buckets) == self.vpin[venue].n:
